@@ -1,0 +1,182 @@
+name: Linux binary prerelease
+
+# An explicit candidate-branch push is the build authorization. Unlike a new
+# workflow_dispatch-only workflow, this works on a fork without changing main
+# or first registering a workflow on its default branch. Nothing publishes to
+# npm, promotes latest, or replaces an existing tag/release.
+on:
+   push:
+      branches: ["release-candidate/linux/**"]
+   workflow_dispatch:
+
+permissions:
+   contents: read
+
+concurrency:
+   group: linux-prerelease-${{ github.sha }}
+   cancel-in-progress: false
+
+jobs:
+   metadata:
+      if: startsWith(github.ref, 'refs/heads/release-candidate/linux/')
+      runs-on: ubuntu-22.04
+      outputs:
+         version: ${{ steps.release.outputs.version }}
+         tag: ${{ steps.release.outputs.tag }}
+         bun: ${{ steps.release.outputs.bun }}
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              ref: ${{ github.sha }}
+              persist-credentials: false
+         - name: Resolve immutable candidate identity
+           id: release
+           run: |
+              node <<'NODE'
+              const fs = require('node:fs');
+              const { execFileSync } = require('node:child_process');
+              const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+              if (!/^[0-9a-f]{40}$/.test(sha) || sha !== process.env.GITHUB_SHA) throw new Error('source SHA mismatch');
+              const versions = ['utils', 'coding-agent', 'natives'].map(name => JSON.parse(fs.readFileSync(`packages/${name}/package.json`, 'utf8')).version);
+              const version = versions[0];
+              if (!/^\d+\.\d+\.\d+$/.test(version) || versions.some(value => value !== version)) throw new Error('source package versions must match');
+              const packageManager = JSON.parse(fs.readFileSync('package.json', 'utf8')).packageManager;
+              if (!/^bun@\d+\.\d+\.\d+$/.test(packageManager)) throw new Error('exact Bun version required');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\ntag=v${version}-candidate.${sha}\nbun=${packageManager.slice(4)}\n`);
+              NODE
+         - name: Refuse an existing candidate tag or release
+           env:
+              GH_TOKEN: ${{ github.token }}
+              RELEASE_TAG: ${{ steps.release.outputs.tag }}
+           run: |
+              gh api graphql -f query='query($owner:String!,$name:String!,$tag:String!,$ref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){id} release(tagName:$tag){id}}}' \
+                -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" \
+                -f tag="$RELEASE_TAG" -f ref="refs/tags/$RELEASE_TAG" > "$RUNNER_TEMP/candidate-existing.json"
+              node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).data.repository;if(!r || r.ref || r.release) throw new Error("candidate tag/release already exists or repository is inaccessible; never replace it");' "$RUNNER_TEMP/candidate-existing.json"
+
+   binary:
+      needs: metadata
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - { os: ubuntu-22.04, arch: x64, native_targets: "linux-x64-baseline linux-x64-modern" }
+               - { os: ubuntu-24.04-arm, arch: arm64, native_targets: "linux-arm64" }
+      runs-on: ${{ matrix.os }}
+      timeout-minutes: 180
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              ref: ${{ github.sha }}
+              persist-credentials: false
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: ${{ needs.metadata.outputs.bun }}
+         - uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+         - uses: ./.github/actions/setup-system-deps
+         - run: bun install --frozen-lockfile
+         - id: cache
+           uses: ./.github/actions/bazel-cache
+           with:
+              scope: linux-prerelease-${{ matrix.arch }}
+         - name: Build native addons from the same source
+           env:
+              OMP_BAZEL_RC: ${{ steps.cache.outputs.rc }}
+              NATIVE_TARGETS: ${{ matrix.native_targets }}
+           run: |
+              set -euo pipefail
+              if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536; fi
+              # Serialize the heavy cdylib links, retaining Bazel's shared cache.
+              for target in $NATIVE_TARGETS; do
+                bun scripts/bazel-natives.ts "$target" --dest packages/natives/native -- --jobs=2
+              done
+         - name: Build with the existing release compiler
+           env:
+              RELEASE_TARGETS: linux-${{ matrix.arch }}
+           run: bun run ci:release:build-binaries
+         - name: Smoke the actual native-host binary and record provenance
+           env:
+              OMP_ARCH: ${{ matrix.arch }}
+              OMP_VERSION: ${{ needs.metadata.outputs.version }}
+              RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+           run: |
+              set -euo pipefail
+              binary="$PWD/packages/coding-agent/binaries/omp-linux-$OMP_ARCH"
+              chmod 0755 "$binary"
+              runtime_dir="$(mktemp -d "$RUNNER_TEMP/omp-smoke.XXXXXX")"
+              export HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg"
+              test "$("$binary" --version)" = "omp/$OMP_VERSION"
+              "$binary" --smoke-test
+              node <<'NODE'
+              const fs = require('node:fs');
+              const crypto = require('node:crypto');
+              const { execFileSync } = require('node:child_process');
+              const e = process.env;
+              if (process.platform !== 'linux' || process.arch !== e.OMP_ARCH) throw new Error('native runner architecture mismatch');
+              const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+              const manifest = {
+                repository: e.GITHUB_REPOSITORY, sourceCommit: e.GITHUB_SHA,
+                workflowRef: e.GITHUB_WORKFLOW_REF, runId: e.GITHUB_RUN_ID, runAttempt: e.GITHUB_RUN_ATTEMPT,
+                releaseTag: e.RELEASE_TAG, version: e.OMP_VERSION, architecture: process.arch,
+                bunVersion: execFileSync('bun', ['--version'], { encoding: 'utf8' }).trim(),
+                bazelVersion: fs.readFileSync('.bazelversion', 'utf8').trim(),
+                bunLockSha256: hash('bun.lock'), cargoLockSha256: hash('Cargo.lock'),
+                nativeHostSmokePassed: true
+              };
+              fs.writeFileSync(`packages/coding-agent/binaries/build-linux-${e.OMP_ARCH}.json`, `${JSON.stringify(manifest, null, 2)}\n`);
+              NODE
+         - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+           with:
+              name: omp-linux-prerelease-${{ matrix.arch }}
+              path: |
+                 packages/coding-agent/binaries/omp-linux-${{ matrix.arch }}
+                 packages/coding-agent/binaries/build-linux-${{ matrix.arch }}.json
+              if-no-files-found: error
+
+   draft:
+      needs: [metadata, binary]
+      runs-on: ubuntu-22.04
+      permissions:
+         contents: write
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              ref: ${{ github.sha }}
+              persist-credentials: false
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: ${{ needs.metadata.outputs.bun }}
+         - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+           with:
+              pattern: omp-linux-prerelease-*
+              path: packages/coding-agent/binaries
+              merge-multiple: true
+         - name: Hash every candidate asset
+           run: |
+              bun scripts/ci-release-checksums.ts SHA256SUMS.txt \
+                packages/coding-agent/binaries/omp-linux-x64 \
+                packages/coding-agent/binaries/omp-linux-arm64 \
+                packages/coding-agent/binaries/build-linux-x64.json \
+                packages/coding-agent/binaries/build-linux-arm64.json \
+                LICENSE THIRD-PARTY-NOTICES.txt
+         - name: Create a new source tag and draft prerelease only
+           env:
+              GH_TOKEN: ${{ github.token }}
+              RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+           run: |
+              set -euo pipefail
+              printf '%s\n' \
+                "Linux binary candidate from immutable source $GITHUB_SHA." \
+                "Built by https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID." \
+                'Both binaries passed --version and --smoke-test on native hosts.' \
+                'Draft only: installed-codec, installer and downstream image gates remain separate. No npm, latest or live deployment publication.' \
+                > "$RUNNER_TEMP/prerelease-notes.txt"
+              gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA"
+              gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --verify-tag --draft --prerelease --latest=false \
+                --title "OMP $RELEASE_TAG Linux binary candidate" --notes-file "$RUNNER_TEMP/prerelease-notes.txt" \
+                packages/coding-agent/binaries/omp-linux-x64 \
+                packages/coding-agent/binaries/omp-linux-arm64 \
+                packages/coding-agent/binaries/build-linux-x64.json \
+                packages/coding-agent/binaries/build-linux-arm64.json \
+                LICENSE THIRD-PARTY-NOTICES.txt SHA256SUMS.txt
