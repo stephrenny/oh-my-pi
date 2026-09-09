@@ -1,4 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import type { ResolvedAnthropicCompat, ResolvedOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog/types";
 import { once } from "@oh-my-pi/pi-utils";
 
 export const getModelsConfigSchemaBundle = once(() => {
@@ -270,7 +272,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 	});
 
 	const ProviderDiscoverySchema = type({
-		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm"',
+		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm" | "provider-wire"',
 		"timeoutMs?": "number",
 		/**
 		 * Defaults to `true`. Set `false` to fetch the model list from
@@ -338,6 +340,10 @@ export const getModelsConfigSchemaBundle = once(() => {
 		if (value.apiKey !== undefined && typeof value.apiKey === "string" && value.apiKey.length === 0) {
 			return ctx.mustBe("apiKey a non-empty string");
 		}
+		if (value.discovery?.type === "provider-wire" &&
+			(value.transport !== "provider-wire" || !value.baseUrl || !value.apiKey)) {
+			return ctx.mustBe("provider-wire discovery with transport: provider-wire, gateway baseUrl and gateway apiKey");
+		}
 		return true;
 	});
 
@@ -355,3 +361,168 @@ export const getModelsConfigSchemaBundle = once(() => {
 });
 
 export const getModelsConfigSchema = () => getModelsConfigSchemaBundle().ModelsConfigSchema;
+
+/** Strict native catalog boundary, separate from permissive user-authored model overrides. */
+export const getProviderWireModelCardSchema = once(() => {
+	const rate = type("number >= 0").narrow(value => Number.isFinite(value));
+	const limit = type("number > 0").narrow(value => Number.isSafeInteger(value));
+	const tokenCount = type("number >= 0").narrow(value => Number.isSafeInteger(value));
+	const rawId = type("string").narrow(value => /^[\x21-\x7e]{1,256}$/.test(value));
+	const effort = type('"minimal" | "low" | "medium" | "high" | "xhigh" | "max"');
+	const effortOrder: readonly string[] = THINKING_EFFORTS;
+	const effortMap = type({
+		"minimal?": "string",
+		"low?": "string",
+		"medium?": "string",
+		"high?": "string",
+		"xhigh?": "string",
+		"max?": "string",
+	});
+	const thinking = type({
+		mode: '"effort" | "budget" | "google-level" | "anthropic-adaptive" | "anthropic-budget-effort"',
+		efforts: effort.array(),
+		"defaultLevel?": effort,
+		"effortMap?": effortMap,
+		"supportsDisplay?": "boolean",
+		"prefixBinding?": "boolean",
+		"effortRouting?": {
+			"off?": rawId,
+			"minimal?": rawId,
+			"low?": rawId,
+			"medium?": rawId,
+			"high?": rawId,
+			"xhigh?": rawId,
+			"max?": rawId,
+		},
+		"effortBudgets?": {
+			"minimal?": tokenCount,
+			"low?": tokenCount,
+			"medium?": tokenCount,
+			"high?": tokenCount,
+			"xhigh?": tokenCount,
+			"max?": tokenCount,
+		},
+		"suppressWhenOff?": "boolean",
+		"requiresEffort?": "boolean",
+	}).narrow((value, ctx) => {
+		if (
+			value.efforts.length === 0 ||
+			value.efforts.some((entry, index) => index > 0 &&
+				effortOrder.indexOf(entry) <= effortOrder.indexOf(value.efforts[index - 1])) ||
+			(value.defaultLevel !== undefined && !value.efforts.includes(value.defaultLevel))
+		) {
+			return ctx.mustBe("nonempty ascending thinking efforts containing the default level");
+		}
+		return true;
+	});
+	const rates = { input: rate, output: rate, cacheRead: rate, cacheWrite: rate };
+	const routing = type({ "only?": "string[]", "order?": "string[]" });
+	const sharedCompat = {
+		"officialEndpoint?": "boolean",
+		"stripImageInput?": "boolean",
+		"supportsForcedToolChoice?": "boolean",
+		"supportsSamplingParams?": "boolean",
+		"streamIdleTimeoutMs?": rate,
+		"thinkingLoopGuard?": '"gemini" | "deepseek" | "xai"',
+	} as const;
+	const anthropicCompat = type({
+		...sharedCompat,
+		"signingEndpoint?": "boolean",
+		"supportsContextManagement?": "boolean",
+		"supportsOutputEffort?": "boolean",
+		"disableStrictTools?": "boolean",
+		"disableAdaptiveThinking?": "boolean",
+		"allowAnthropicHeaderOverrides?": "boolean",
+		"supportsEagerToolInputStreaming?": "boolean",
+		"supportsLongCacheRetention?": "boolean",
+		"supportsMidConversationSystem?": "boolean",
+		"supportsTurnScopedSystem?": "boolean",
+		"supportsMidConversationToolChanges?": "boolean",
+		"supportsPerMessageEffort?": "boolean",
+		"supportsThinkingBindingControls?": "boolean",
+		"requiresToolResultId?": "boolean",
+		"requiresThinkingEnabled?": "boolean",
+		"replayUnsignedThinking?": "boolean",
+		"escapeBuiltinToolNames?": "boolean",
+		"injectClaudeCodeInstruction?": "boolean",
+	} satisfies Record<`${keyof ResolvedAnthropicCompat}?`, unknown>);
+	const responsesCompat = type({
+		...sharedCompat,
+		"supportsDeveloperRole?": "boolean",
+		"supportsStrictMode?": "boolean",
+		"supportsReasoningEffort?": "boolean",
+		"reasoningEffortMap?": effortMap,
+		"supportsReasoningParams?": "boolean",
+		"supportsPenaltyAndStopParams?": "boolean",
+		"thinkingFormat?": '"openai" | "openrouter" | "zai" | "kimi" | "qwen" | "qwen-chat-template" | "chat-template"',
+		"kimiApiFormat?": '"openai" | "anthropic"',
+		"reasoningDisableMode?": '"omit" | "lowest-effort" | "none-effort" | "openrouter-enabled-false" | "cline-enabled-false" | "venice-disable-thinking" | "zai-thinking-disabled" | "qwen-enable-thinking-false" | "qwen-template-false" | "chat-template-thinking-false"',
+		"omitReasoningEffort?": "boolean",
+		"includeEncryptedReasoning?": "boolean",
+		"filterReasoningHistory?": "boolean",
+		"disableReasoningOnForcedToolChoice?": "boolean",
+		"disableReasoningOnToolChoice?": "boolean",
+		"supportsToolChoice?": "boolean",
+		"supportsNamedToolChoice?": "boolean",
+		"reasoningContentField?": '"reasoning_content" | "reasoning" | "reasoning_text"',
+		"requiresReasoningContentForToolCalls?": "boolean",
+		"requiresReasoningContentForAllAssistantTurns?": "boolean",
+		"allowsSyntheticReasoningContentForToolCalls?": "boolean",
+		"replayReasoningContent?": "boolean",
+		"qwenPreserveThinking?": "boolean",
+		"qwenTemplateReasoningEffort?": "boolean",
+		"requiresThinkingAsText?": "boolean",
+		"requiresMistralToolIds?": "boolean",
+		"requiresToolResultName?": "boolean",
+		"requiresAssistantAfterToolResult?": "boolean",
+		"requiresAssistantContentForToolCalls?": "boolean",
+		"stripDeepseekSpecialTokens?": "boolean",
+		"streamMarkupHealingPattern?": '"kimi" | "dsml" | "qwen" | "thinking"',
+		"streamFirstEventTimeoutMs?": rate,
+		"reasoningDeltasMayBeCumulative?": "boolean",
+		"emptyLengthFinishIsContextError?": "boolean",
+		"usesOpenAIToolCallIdLimit?": "boolean",
+		"promptCacheSessionHeader?": '"x-grok-conv-id"',
+		"supportsPromptCacheBreakpoints?": "boolean",
+		"promptCacheBreakpointTtl?": '"30m"',
+		"isOpenRouterHost?": "boolean",
+		"alwaysSendMaxTokens?": "boolean",
+		"clampOutputToModelMax?": "boolean",
+		"openRouterRouting?": routing,
+		"wireModelIdMode?": '"raw" | "cline-pass" | "firepass" | "fireworks" | "openrouter"',
+		"toolSchemaFlavor?": '"moonshot-mfjs"',
+		"rejectRootObjectUnion?": "boolean",
+		"retryWithoutStrictOnGrammarError?": "boolean",
+		"supportsLongPromptCacheRetention?": "boolean",
+		"strictResponsesPairing?": "boolean",
+		"supportsImageDetailOriginal?": "boolean",
+		"supportsObfuscationOptOut?": "boolean",
+		"supportsAllTurnsReasoningContext?": "boolean",
+		"supportsConfigurationUpdate?": "boolean",
+		"requiresReasoningOffJuiceInstruction?": "boolean",
+		"supportsReasoningSummary?": "boolean",
+		"vercelGatewayRouting?": routing,
+		"isVercelGatewayHost?": "boolean",
+		"harmonyLeakMitigation?": "boolean",
+		"cacheControlFormat?": '"anthropic"',
+	} satisfies Record<`${keyof ResolvedOpenAIResponsesCompat}?`, unknown>);
+	const fields = {
+		id: "string",
+		object: '"model"',
+		owned_by: "string",
+		"_provider?": "string",
+		display_name: "string > 0",
+		input_modalities: type('("text" | "image")[]').narrow(value => value.length > 0),
+		context_length: limit,
+		max_output_tokens: limit,
+		reasoning: "boolean",
+		"thinking?": thinking,
+		"request_model_id?": rawId,
+		cost: { ...rates, "longContext?": { ...rates, inputThreshold: tokenCount, "inputThresholdInclusive?": "boolean" } },
+		"service_tier_cost?": { "flex?": rate, "priority?": rate },
+	} as const;
+	return type({ ...fields, api: '"anthropic-messages"', "compat?": anthropicCompat })
+		.or(type({ ...fields, api: '"openai-codex-responses"', "compat?": responsesCompat }))
+		.onDeepUndeclaredKey("reject")
+		.narrow((value, ctx) => value.reasoning || !value.thinking || ctx.mustBe("thinking only on a reasoning model"));
+});

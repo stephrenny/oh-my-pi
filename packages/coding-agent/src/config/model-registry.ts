@@ -903,6 +903,8 @@ export class ModelRegistry {
 	#loadBuiltInModels(overrides: Map<string, ProviderOverride>, providerFilter?: ReadonlySet<string>): Model<Api>[] {
 		return getBundledProviders().flatMap(provider => {
 			if (providerFilter && !providerFilter.has(provider)) return [];
+			if (this.#discoverableProviders.some(config =>
+				config.provider === provider && config.discovery.type === "provider-wire")) return [];
 			const models = getBundledModels(provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[];
 			const providerOverride = overrides.get(provider);
 
@@ -1209,6 +1211,19 @@ export class ModelRegistry {
 	}
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
+		if (providerConfig.discovery.type === "provider-wire") {
+			// The cache stores catalog data only. Every header belongs to local config,
+			// so restore it live after cache/network resolution, never persist a bearer.
+			const override = this.#providerOverrides.get(providerConfig.provider);
+			return models.map(model => mergeDiscoveredModel(model, undefined, override));
+		}
+		if (providerConfig.transport) {
+			models = models.map(model => buildModel({
+				...toModelSpec(model),
+				transport: providerConfig.transport,
+				baseUrl: providerConfig.baseUrl ?? model.baseUrl,
+			}));
+		}
 		const withDecoderMetadata =
 			providerConfig.discovery.type === "ollama" ||
 			providerConfig.discovery.type === "llama.cpp" ||
@@ -1391,18 +1406,21 @@ export class ModelRegistry {
 				keylessProviders.add(providerName);
 			}
 
-			if (providerConfig.discovery && (providerConfig.api || providerConfig.discovery.type === "proxy")) {
+			if (providerConfig.discovery && (
+				providerConfig.api || providerConfig.discovery.type === "proxy" ||
+				providerConfig.discovery.type === "provider-wire"
+			)) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
 				discoverableProviders.push({
 					provider: providerName,
-					// Proxy discovery derives per-model api from /v1/models's
-					// supported_endpoint_types; the provider-level api is only a
-					// fallback for entries that don't advertise one.
+					// Proxy may use a fallback API. Native cards MUST supply their own;
+					// provider-wire discovery never consults this fallback.
 					api: (providerConfig.api ?? "openai-completions") as Api,
 					baseUrl: providerConfig.baseUrl,
 					headers: resolvedProviderHeaders,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
 					remoteCompaction: providerConfig.remoteCompaction,
+					transport: providerConfig.transport,
 					discovery: providerConfig.discovery,
 					optional: false,
 				});
@@ -1469,12 +1487,17 @@ export class ModelRegistry {
 		const configuredDiscovered = configuredDiscoveryResults
 			.filter(result => currentDiscoverableProviders.has(result.provider))
 			.flatMap(result => result.models);
+		const nativeProviders = new Set(configuredDiscoveryResults
+			.filter(result => currentDiscoverableProviders.has(result.provider) &&
+				result.provider.discovery.type === "provider-wire")
+			.map(result => result.provider.provider));
 		const discovered = [...configuredDiscovered, ...builtInDiscovery.models];
-		if (discovered.length === 0 && builtInDiscovery.authoritativeProviders.size === 0) {
+		if (discovered.length === 0 && builtInDiscovery.authoritativeProviders.size === 0 && nativeProviders.size === 0) {
 			return;
 		}
 		const touchedProviders = new Set(discovered.map(model => model.provider));
 		for (const provider of builtInDiscovery.authoritativeProviders) touchedProviders.add(provider);
+		for (const provider of nativeProviders) touchedProviders.add(provider);
 		const existingModels = this.#hasFullSnapshot
 			? this.#unprojectedModels
 			: this.#composeUnprojectedStaticModels(touchedProviders);
@@ -1491,6 +1514,7 @@ export class ModelRegistry {
 		for (const provider of builtInDiscovery.authoritativeProviders) {
 			authoritativeProviders.add(provider);
 		}
+		for (const provider of nativeProviders) authoritativeProviders.add(provider);
 
 		this.#runtimeDiscoveredModels = this.#runtimeDiscoveredModels.filter(
 			model => !touchedProviders.has(model.provider),
@@ -1548,6 +1572,10 @@ export class ModelRegistry {
 	}
 
 	#configuredDiscoveryCacheProviderId(providerConfig: DiscoveryProviderConfig): string {
+		if (providerConfig.discovery.type === "provider-wire") {
+			// Never satisfy a native catalog with bundled/proxy rows or another gateway's roster.
+			return `${providerConfig.provider}:provider-wire-v1:${providerConfig.baseUrl}`;
+		}
 		if (providerConfig.discovery.type === "ollama") {
 			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
 		}
@@ -1614,10 +1642,10 @@ export class ModelRegistry {
 		let discoveryError: string | undefined;
 		const fetchDynamicModels = async (): Promise<readonly ModelSpec<Api>[] | null> => {
 			try {
-				const models = this.#applyProviderModelOverrides(
-					providerId,
-					await discoverModelsByProviderType(providerConfig, this.#discoveryContext()),
-				);
+				const discovered = await discoverModelsByProviderType(providerConfig, this.#discoveryContext());
+				const models = providerConfig.discovery.type === "provider-wire"
+					? discovered
+					: this.#applyProviderModelOverrides(providerId, discovered);
 				this.#lastDiscoveryWarnings.delete(providerId);
 				return models.map(toModelSpec);
 			} catch (error) {
@@ -1633,6 +1661,7 @@ export class ModelRegistry {
 			cacheProviderId,
 			cacheTtlMs: 24 * 60 * 60 * 1000,
 			fetchDynamicModels,
+			dynamicModelsAuthoritative: providerConfig.discovery.type === "provider-wire",
 			restorableHeaderFallback: this.#configuredDiscoveryHeaderFallback(providerId),
 		});
 		const result = await manager.refresh(effectiveStrategy);
@@ -1672,6 +1701,13 @@ export class ModelRegistry {
 		return {
 			fetch: this.#fetch,
 			getBearerApiKeyResolver: async provider => {
+				if (this.#discoverableProviders.some(config =>
+					config.provider === provider && config.discovery.type === "provider-wire")) {
+					// A gateway bearer is not a provider OAuth credential. Catalog auth
+					// failure must never rotate local accounts or call a broker.
+					const keyConfig = this.#customProviderApiKeys.get(provider);
+					return keyConfig ? resolveConfigValue(keyConfig) : undefined;
+				}
 				const apiKey = await this.getApiKeyForProvider(provider);
 				if (!isDiscoveryBearerApiKey(apiKey)) {
 					return undefined;
@@ -2159,6 +2195,7 @@ export class ModelRegistry {
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
 		const extendedContext = isExtendedContextEnabledFromSettings(this.#settings);
 		return models.map(model => {
+			if (model.catalogSource === "provider-wire") return model;
 			if (extendedContext) {
 				const maximum = resolveMaxContextWindow(model);
 				if (maximum !== undefined && model.contextWindow !== null && maximum > model.contextWindow) {
@@ -2386,6 +2423,17 @@ export class ModelRegistry {
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {
 		return this.#providerDiscoveryStates.get(provider);
+	}
+
+	/** Native catalog errors must be visible even when the last valid snapshot remains available. */
+	getProviderWireDiscoveryErrors(): { provider: string; error: string }[] {
+		const errors: { provider: string; error: string }[] = [];
+		for (const config of this.#discoverableProviders) {
+			if (config.discovery.type !== "provider-wire") continue;
+			const error = this.#providerDiscoveryStates.get(config.provider)?.error;
+			if (error) errors.push({ provider: config.provider, error });
+		}
+		return errors;
 	}
 
 	/**

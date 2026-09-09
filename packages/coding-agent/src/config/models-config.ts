@@ -80,7 +80,8 @@ export function validateProviderConfiguration(
 		}
 	}
 
-	if (mode === "models-config" && config.discovery && !config.api && config.discovery.type !== "proxy") {
+	if (mode === "models-config" && config.discovery && !config.api &&
+		config.discovery.type !== "proxy" && config.discovery.type !== "provider-wire") {
 		throw new Error(`Provider ${providerName}: "api" is required when discovery is enabled at provider level.`);
 	}
 

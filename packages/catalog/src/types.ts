@@ -1156,6 +1156,8 @@ export interface Model<TApi extends Api = Api> {
 	 * Only the gateway holds provider credentials; `apiKey` is its bearer.
 	 */
 	transport?: "pi-native" | "provider-wire";
+	/** Authoritative native gateway metadata; retained through spec/cache rebuilds, never inferred from transport. */
+	catalogSource?: "provider-wire";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
 	/** Codex Responses Lite transport: send the lite marker and carry instructions/tools as input items (mirrors codex-rs `use_responses_lite`). */

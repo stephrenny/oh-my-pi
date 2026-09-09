@@ -975,6 +975,13 @@ export function collapseVariants<TSpec extends VariantSpecLike>(
 	specs: readonly TSpec[],
 	opts?: { table?: VariantCollapseTable },
 ): TSpec[] {
+		// A gateway already owns these identities and thinking routes. Never merge
+		// catalog-only additions into local aliases or synthesize a different id.
+		if (specs.some(spec => spec.catalogSource === "provider-wire")) {
+			const native = specs.filter(spec => spec.catalogSource === "provider-wire");
+			const local = specs.filter(spec => spec.catalogSource !== "provider-wire");
+			return [...collapseVariants(local, opts), ...native];
+		}
 	if (opts?.table !== undefined) return collapseWithTable(specs, opts.table);
 	const byProvider = new Map<string, TSpec[]>();
 	for (const spec of specs) {

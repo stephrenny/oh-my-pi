@@ -2497,6 +2497,156 @@ providers:
 		expect(registry.find("lm-studio-test", "local-vlm")?.input).toEqual(["text", "image"]);
 	});
 
+	function nativeCard(provider: "anthropic" | "openai-codex", id: string) {
+		return {
+			id: `${provider}/${id}`,
+			object: "model",
+			owned_by: provider,
+			api: provider === "anthropic" ? "anthropic-messages" : "openai-codex-responses",
+			display_name: `Catalog: ${id}`,
+			input_modalities: ["text"],
+			context_length: 345_678,
+			max_output_tokens: 12_345,
+			reasoning: true,
+			thinking: {
+				mode: provider === "anthropic" ? "anthropic-adaptive" : "effort",
+				efforts: ["low", "high"],
+				defaultLevel: "high",
+				requiresEffort: false,
+			},
+			compat: { supportsForcedToolChoice: false, supportsSamplingParams: true },
+			cost: {
+				input: 1.25, output: 4.5, cacheRead: 0.125, cacheWrite: 1.5,
+				longContext: { inputThreshold: 100_000, input: 2.5, output: 9, cacheRead: 0.25, cacheWrite: 3 },
+			},
+			service_tier_cost: { priority: 1.75 },
+		};
+	}
+
+	test("provider-wire catalog owns metadata and raw ids through refresh and a warm cache", async () => {
+		const baseUrl = "http://127.0.0.1:9998/gateway";
+		writeRawModelsJson(Object.fromEntries(["anthropic", "openai-codex"].map(provider => [provider, {
+			baseUrl, apiKey: "gateway-key", transport: "provider-wire", discovery: { type: "provider-wire" },
+			headers: { "X-Client": "current-config" },
+			modelOverrides: { "claude-fable-5-1": { headers: { "X-Model": "current-model-config" } } },
+		}])));
+		const fable = { ...nativeCard("anthropic", "claude-fable-5-1"), request_model_id: "raw/fable" };
+		const cards = [
+			fable,
+			nativeCard("anthropic", "lab/reasoner"),
+			nativeCard("anthropic", "lab/reasoner-thinking"),
+			nativeCard("openai-codex", "lab/future"),
+			{ id: "foreign/not-our-protocol", owned_by: "foreign", api: "future-protocol" },
+		];
+		let requests = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			expect(String(input)).toBe(`${baseUrl}/v1/models`);
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer gateway-key");
+			requests++;
+			return Response.json({ object: "list", data: cards });
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+		await registry.refreshDiscoverableProviders(["anthropic", "openai-codex"], "online");
+		expect(getModelsForProvider(registry, "anthropic").map(model => model.id).sort()).toEqual([
+			"claude-fable-5-1", "lab/reasoner", "lab/reasoner-thinking",
+		]);
+		expect(getModelsForProvider(registry, "openai-codex").map(model => model.id)).toEqual(["lab/future"]);
+		const model = registry.find("anthropic", "claude-fable-5-1");
+		expect(model).toMatchObject({
+			api: "anthropic-messages",
+			baseUrl,
+			transport: "provider-wire",
+			requestModelId: "raw/fable",
+			name: fable.display_name,
+			contextWindow: fable.context_length,
+			maxTokens: fable.max_output_tokens,
+			input: fable.input_modalities,
+			thinking: fable.thinking,
+			cost: fable.cost,
+			serviceTierCost: fable.service_tier_cost,
+			compat: fable.compat,
+			headers: { "X-Client": "current-config", "X-Model": "current-model-config" },
+		});
+		const beforeCache = requests;
+		const warm = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+		await warm.refreshDiscoverableProviders(["anthropic", "openai-codex"], "offline");
+		expect(warm.find("anthropic", "claude-fable-5-1")).toEqual(model);
+		expect(warm.find("anthropic", "lab/reasoner-thinking")?.transport).toBe("provider-wire");
+		expect(warm.find("openai-codex", "lab/future")?.api).toBe("openai-codex-responses");
+		expect(requests).toBe(beforeCache);
+	});
+
+	test("provider-wire catalog removal prunes cached models rather than restoring bundled models", async () => {
+		writeRawModelsJson({
+			anthropic: {
+				baseUrl: "http://127.0.0.1:9998", apiKey: "gateway-key",
+				transport: "provider-wire", discovery: { type: "provider-wire" },
+			},
+		});
+		let cards = [nativeCard("anthropic", "claude-fable-5-1")];
+		const fetchMock: FetchImpl = async () => Response.json({ object: "list", data: cards });
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+		await registry.refreshDiscoverableProviders(["anthropic"], "online");
+		expect(getModelsForProvider(registry, "anthropic").map(model => model.id)).toEqual(["claude-fable-5-1"]);
+		cards = [];
+		await registry.refreshDiscoverableProviders(["anthropic"], "online");
+		expect(getModelsForProvider(registry, "anthropic")).toEqual([]);
+		expect(registry.getProviderDiscoveryState("anthropic")?.status).toBe("empty");
+		const warm = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+		expect(getModelsForProvider(warm, "anthropic")).toEqual([]);
+	});
+
+	test("provider-wire catalog auth refusal never falls back to a local OAuth account", async () => {
+		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
+		await authStorage.set("anthropic", {
+			type: "oauth", access: "sk-ant-oat-expired-anthropic", refresh: "local-refresh",
+			expires: Date.now() - 60_000,
+		});
+		const baseUrl = "http://127.0.0.1:9998";
+		writeRawModelsJson({
+			anthropic: {
+				baseUrl, apiKey: "refused-gateway-key",
+				transport: "provider-wire", discovery: { type: "provider-wire" },
+			},
+		});
+		const requests: { url: string; authorization: string | null }[] = [];
+		const fetchMock: FetchImpl = async (input, init) => {
+			requests.push({ url: String(input), authorization: new Headers(init?.headers).get("Authorization") });
+			return Response.json({ error: "invalid gateway key" }, { status: 401 });
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+		await registry.refreshDiscoverableProviders(["anthropic"], "online");
+		expect(requests).toEqual([{ url: `${baseUrl}/v1/models`, authorization: "Bearer refused-gateway-key" }]);
+		expect(refreshCalls).toEqual([]);
+		expect(registry.getProviderDiscoveryState("anthropic")?.status).toBe("unavailable");
+		expect(getModelsForProvider(registry, "anthropic")).toEqual([]);
+	});
+
+	test.each([
+		{ api: "future-protocol" },
+		{ cost: null },
+		{ context_length: 0 },
+		{ input_modalities: ["audio"] },
+		{ thinking: { mode: "new-mode", efforts: ["low"] } },
+		{ compat: { unknownRequiredWireField: true } },
+		{ owned_by: "anthropic", _provider: "openai-codex" },
+	])("provider-wire rejects unrepresentable own-provider cards without bundled fallback: %j", async patch => {
+		writeRawModelsJson({
+			anthropic: {
+				baseUrl: "http://127.0.0.1:9998", apiKey: "gateway-key",
+				transport: "provider-wire", discovery: { type: "provider-wire" },
+			},
+		});
+		const fetchMock: FetchImpl = async () => Response.json({
+			object: "list", data: [{ ...nativeCard("anthropic", "claude-fable-5-1"), ...patch }],
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+		await registry.refreshDiscoverableProviders(["anthropic"], "online");
+		expect(registry.getProviderDiscoveryState("anthropic")?.status).toBe("unavailable");
+		expect(registry.getProviderWireDiscoveryErrors()).toEqual([{ provider: "anthropic", error: expect.any(String) }]);
+		expect(getModelsForProvider(registry, "anthropic")).toEqual([]);
+	});
+
 	test("proxy discovery honors API-reported context_length and endpoint routing", async () => {
 		writeRawModelsJson({
 			"proxy-test": {

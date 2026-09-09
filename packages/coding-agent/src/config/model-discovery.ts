@@ -24,6 +24,7 @@ import {
 import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ProviderDiscovery } from "./models-config-schema";
+import { getProviderWireModelCardSchema } from "./models-config-schema-bundle";
 
 // Default cap on `max_tokens` for auto-discovered models that do not advertise
 // their own output limit (OpenAI-models-list, Ollama, llama.cpp, new-api/
@@ -153,6 +154,7 @@ export interface DiscoveryProviderConfig {
 	headers?: Record<string, string>;
 	compat?: ModelSpec<Api>["compat"];
 	remoteCompaction?: RemoteCompactionConfig<Api>;
+	transport?: Model<Api>["transport"];
 	discovery: ProviderDiscovery;
 	optional?: boolean;
 }
@@ -410,6 +412,8 @@ export function discoverModelsByProviderType(
 			return discoverProxyModels(providerConfig, ctx);
 		case "litellm":
 			return discoverLiteLLMModels(providerConfig, ctx);
+		case "provider-wire":
+			return discoverProviderWireModels(providerConfig, ctx);
 	}
 }
 
@@ -1085,6 +1089,86 @@ export async function discoverProxyModels(
 		);
 	}
 	return discovered;
+}
+
+/** Native catalog cards carry the complete model contract; no id-based inference belongs here. */
+export async function discoverProviderWireModels(
+	providerConfig: DiscoveryProviderConfig,
+	ctx: DiscoveryContext,
+): Promise<Model<Api>[]> {
+	if (!providerConfig.baseUrl) throw new Error("provider-wire discovery requires a gateway baseUrl");
+	const gateway = new URL(providerConfig.baseUrl);
+	if (
+		!["https:", "http:"].includes(gateway.protocol) ||
+		gateway.username || gateway.password || gateway.search || gateway.hash
+	) {
+		throw new Error("provider-wire discovery requires an HTTP(S) gateway root without credentials, query or fragment");
+	}
+	const modelsUrl = `${gateway.href.replace(/\/+$/, "")}/v1/models`;
+	const attempt = (headers: Record<string, string>) =>
+		withTimeoutSignal(providerConfig.discovery.timeoutMs ?? REMOTE_DISCOVERY_TIMEOUT_MS, async signal => {
+			const response = await ctx.fetch(modelsUrl, { headers, signal });
+			if (!response.ok) throw new Error(`HTTP ${response.status} from ${modelsUrl}`);
+			return await response.json() as unknown;
+		});
+	const baseHeaders = providerConfig.headers ?? {};
+	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
+	const payload = apiKey
+		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
+		: await attempt(baseHeaders);
+	if (!isRecord(payload) || payload.object !== "list" || !Array.isArray(payload.data)) {
+		throw new Error(`Invalid provider-wire catalog from ${modelsUrl}: expected a model list`);
+	}
+	const schema = getProviderWireModelCardSchema();
+	const models: Model<Api>[] = [];
+	const ids = new Set<string>();
+	for (const item of payload.data) {
+		if (
+			!isRecord(item) ||
+			typeof item.owned_by !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(item.owned_by) ||
+			(item._provider !== undefined && item._provider !== item.owned_by) ||
+			typeof item.id !== "string" || !item.id.startsWith(`${item.owned_by}/`)
+		) {
+			throw new Error(`Invalid provider-wire catalog identity from ${modelsUrl}`);
+		}
+		// A shared catalog includes other providers, possibly with protocols this client cannot speak.
+		if (item.owned_by !== providerConfig.provider) continue;
+		const id = item.id.slice(item.owned_by.length + 1);
+		if (!/^[\x21-\x7e]{1,256}$/.test(id) || ids.has(id)) {
+			throw new Error(`Invalid or duplicate provider-wire model id: ${item.id}`);
+		}
+		try {
+			const card = schema.assert(item);
+			if (!(
+				(card.owned_by === "anthropic" && card.api === "anthropic-messages") ||
+				(card.owned_by === "openai-codex" && card.api === "openai-codex-responses")
+			)) {
+				throw new Error("unsupported provider-wire provider/API pair");
+			}
+			models.push(buildModel({
+				id,
+				requestModelId: card.request_model_id,
+				provider: providerConfig.provider,
+				api: card.api,
+				baseUrl: providerConfig.baseUrl,
+				transport: "provider-wire",
+				catalogSource: "provider-wire",
+				name: card.display_name,
+				reasoning: card.reasoning,
+				thinking: card.thinking,
+				input: card.input_modalities,
+				contextWindow: card.context_length,
+				maxTokens: card.max_output_tokens,
+				cost: card.cost,
+				serviceTierCost: card.service_tier_cost,
+				compat: card.compat,
+			} as ModelSpec<Api>));
+		} catch (error) {
+			throw new Error(`Invalid provider-wire model ${item.id}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		ids.add(id);
+	}
+	return models;
 }
 
 export function normalizeLlamaCppBaseUrl(baseUrl?: string): string {

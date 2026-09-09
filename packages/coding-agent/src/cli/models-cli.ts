@@ -68,6 +68,9 @@ interface ModelJson {
 	id: string;
 	selector: string;
 	name: string;
+	api: Api;
+	transport?: Model<Api>["transport"];
+	baseUrl?: string;
 	contextWindow: number | null;
 	maxTokens: number | null;
 	reasoning: boolean;
@@ -79,6 +82,7 @@ interface ModelJson {
 
 interface ModelsJson {
 	models: ModelJson[];
+	discoveryErrors?: { provider: string; error: string }[];
 }
 
 function writeLine(line = ""): void {
@@ -109,6 +113,10 @@ function toModelJson(model: Model<Api>): ModelJson {
 		id: model.id,
 		selector: `${model.provider}/${model.id}`,
 		name: model.name,
+		api: model.api,
+		transport: model.transport,
+		// Native roots are validated credential-free. Other provider URLs may contain keys.
+		baseUrl: model.catalogSource === "provider-wire" ? model.baseUrl : undefined,
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
 		reasoning: model.reasoning,
@@ -197,6 +205,13 @@ function renderProviderModels(
 	}
 
 	const configError = modelRegistry.getError();
+	const discoveryErrors = modelRegistry.getProviderWireDiscoveryErrors();
+	if (discoveryErrors.length > 0) {
+		process.exitCode = 1;
+		for (const { provider, error } of discoveryErrors) {
+			process.stderr.write(`Native catalog discovery failed for ${provider}: ${error}\n`);
+		}
+	}
 
 	if (json) {
 		if (configError) {
@@ -204,7 +219,10 @@ function renderProviderModels(
 				`Warning: models.yml validation failed — custom providers disabled\n${configError.message}\n`,
 			);
 		}
-		const output: ModelsJson = { models: filtered.slice().sort(byProviderThenId).map(toModelJson) };
+		const output: ModelsJson = {
+			models: filtered.slice().sort(byProviderThenId).map(toModelJson),
+			...(discoveryErrors.length > 0 ? { discoveryErrors } : {}),
+		};
 		writeLine(JSON.stringify(output));
 		return;
 	}

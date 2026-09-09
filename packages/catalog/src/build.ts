@@ -38,7 +38,7 @@ function isInputModalities(value: unknown): value is ("text" | "image")[] {
  */
 function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: Record<string, unknown>): void {
 	const serviceTierCost = objectPayload(catalog.serviceTierCost);
-	if (serviceTierCost !== undefined) {
+	if (serviceTierCost !== undefined && model.catalogSource !== "provider-wire") {
 		const flex = numberField(serviceTierCost, "flex");
 		const priorityTier = numberField(serviceTierCost, "priority");
 		model.serviceTierCost = {
@@ -208,17 +208,17 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 	const supportsComputerUseConfig = explicitComputerUseConfig(spec);
 	const model: Model<TApi> = {
 		...spec,
-		name: cleanModelName(spec.name),
+		name: spec.catalogSource === "provider-wire" ? spec.name : cleanModelName(spec.name),
 		identity: policy.identity,
 		requiresGlyphTokenization: policy.identity.class === "anthropic",
 		tokenizer: spec.tokenizer ?? resolveModelTokenizer(spec.requestModelId ?? spec.id),
-		thinking: policy.thinking,
+		thinking: spec.catalogSource === "provider-wire" ? spec.thinking : policy.thinking,
 		supportsComputerUse: supportsOpenAIGAComputerUse(spec, policy.identity, supportsComputerUseConfig),
 		supportsComputerUseConfig,
 		compat: policy.compat,
 		compatConfig: spec.compat,
 	};
 	applyCatalogAssignments(model, policy.catalog);
-	applyCatalogCorrections(model, policy.catalog);
+	if (spec.catalogSource !== "provider-wire") applyCatalogCorrections(model, policy.catalog);
 	return model;
 }
